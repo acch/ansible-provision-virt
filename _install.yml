@@ -33,12 +33,13 @@
         force_basic_auth: true
         url_username: "{{ ansible_env['GITHUB_USER'] }}"
         url_password: "{{ ansible_env['GITHUB_TOKEN'] }}"
+        mode: "0644"
 
     - name: Prepare target directory for acch/ansible-provision-virt
       file:
         path: "{{ (playbook_dir, '/provision') | join }}"
         state: directory
-        mode: "0775"
+        mode: "0755"
 
     - name: Extract acch/ansible-provision-virt to target directory
       unarchive:
