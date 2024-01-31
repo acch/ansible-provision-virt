@@ -4,12 +4,19 @@
   gather_facts: false
 
   tasks:
+    - name: Gather environment variables
+      setup:
+        gather_subset:
+          - "!all"
+          - "!min"
+          - env
+
     - name: Check mandatory variables
       assert:
         that:
-          - "{{ ansible_env['GITHUB_USER'] is defined }}"
-          - "{{ ansible_env['GITHUB_TOKEN'] is defined }}"
-        msg: Please define the variables 'GITHUB_USER' and 'GITHUB_TOKEN'!
+          - ansible_env["GITHUB_USER"] is defined
+          - ansible_env["GITHUB_TOKEN"] is defined
+        msg: Please define the variables "GITHUB_USER" and "GITHUB_TOKEN"!
 
     - name: Find latest release of acch/ansible-provision-virt
       uri:
