@@ -1,0 +1,319 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Provision | Check mandatory variables
+      assert:
+        that:
+          - "{{ distro is defined }}"
+          - "{{ guests is defined }}"
+        msg: Please define the variables 'distro' and 'guests'!
+
+    - name: Provision | Add guests to inventory
+      vars:
+        # Identify interfaces with-, and without gateway (external / internal)
+        ext_if: "{{ item.interfaces | selectattr('gateway', 'defined') | list }}"
+        int_if: "{{ item.interfaces | selectattr('gateway', 'undefined') | list }}"
+        hypervisor: "{{ item.hypervisor | default(default.hypervisor) | default('localhost') }}"
+        hypervisor_ip: "{{ item.hypervisor_ip | default(default.hypervisor_ip) | default(hostvars[hypervisor].ansible_host) }}"
+        webserver: "{{ item.webserver | default(default.webserver) | default(hostvars[hypervisor].ansible_host) }}"
+        default_location: http://{{ webserver }}/yum/{{ distro }}/
+      add_host:
+        name: "{{ item.name }}"
+        # Use IP of first interface for Ansible communication. Prefer interfaces with gateway (external).
+        ansible_host: "{{ (ext_if + int_if) | map(attribute='ip') | first }}"
+        ansible_user: root
+        ansible_ssh_common_args: -o StrictHostKeyChecking=no
+        group: new_guests
+        provision_distro: "{{ distro }}"
+        provision_cpu: "{{ item.cpu | default(default.cpu) | default(2) }}"
+        provision_memory: "{{ item.memory | default(default.memory) | default(4096) }}"
+        provision_disk: "{{ item.disk | default(default.disk) | default(10) }}"
+        provision_interfaces: "{{ item.interfaces }}"
+        provision_external_interfaces: "{{ ext_if }}"
+        provision_internal_interfaces: "{{ int_if }}"
+        provision_hypervisor: "{{ hypervisor }}"
+        provision_hypervisor_ip: "{{ hypervisor_ip }}"
+        provision_webserver: "{{ webserver }}"
+        provision_ntpserver: "{{ ntpserver | default('_gateway') }}"
+        provision_location: "{{ item.location | default(default.location) | default(default_location) }}"
+        provision_packages: "{{ extra_packages | default([]) }}"
+      loop: "{{ guests }}"
+      changed_when: false
+
+    - name: Provision | Print guest details
+      debug:
+        var: hostvars[item]
+        verbosity: 2
+      loop: "{{ groups['new_guests'] }}"
+
+    - name: Provision | Collect hypervisors
+      add_host:
+        name: "{{ hostvars[item.name].provision_hypervisor }}"
+        group: new_guests_hypervisors
+      loop: "{{ guests }}"
+      loop_control:
+        label: "{{ hostvars[item.name].provision_hypervisor }}"
+      changed_when: false
+
+    - name: Provision | Check if hypervisors are reachable
+      ping:
+      delegate_to: "{{ item }}"
+      connection: ssh
+      loop: "{{ groups['new_guests_hypervisors'] }}"
+
+    - name: Provision | Ask for confirmation
+      pause:
+        prompt: |-
+          ################################################################################
+          This will destroy the following guests: {{ guests | map(attribute='name') | join(', ') }}!
+          Skip installation (dry run): {{ skip_install | default(false) }}
+          ################################################################################
+          Press <enter> if this is what you want, or press <ctrl-c a> to abort.
+
+    - name: Provision | Clean known_hosts
+      known_hosts:
+        name: "{{ hostvars[item].ansible_host }}"
+        state: absent
+      failed_when: false
+      loop: "{{ groups['new_guests'] }}"
+
+- hosts: new_guests_hypervisors
+  gather_facts: false
+
+  vars:
+    provision_exclusive: "{{ exclusive | default(false) }}"
+    provision_skip_install: "{{ skip_install | default(false) }}"
+
+  tasks:
+    - block: ## when: provision_exclusive | bool and not provision_skip_install | bool
+        - name: Provision | Find running domains
+          command: /usr/bin/virsh list
+            --state-running
+            --name
+          register: running_doms
+          changed_when: false
+
+        - name: Provision | Destroy running domains
+          command: /usr/bin/virsh destroy
+            --domain {{ item }}
+          loop: "{{ running_doms.stdout_lines }}"
+
+      when:
+        - provision_exclusive | bool
+        - not provision_skip_install | bool
+
+- hosts: new_guests
+  gather_facts: false
+  serial: "{{ parallel | default(3) }}"
+
+  vars:
+    provision_base: "{{ force_base | default(false) }}"
+    provision_skip_install: "{{ skip_install | default(false) }}"
+
+  tasks:
+    # https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/installation_guide/sect-kickstart-syntax
+    # https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/virtualization_deployment_and_administration_guide/sect-guest_virtual_machine_installation_overview-creating_guests_with_virt_install
+    # https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/8/html/performing_an_advanced_rhel_installation/kickstart-commands-and-options-reference_installing-rhel-as-an-experienced-user
+
+    - block: ## delegate_to: "{{ provision_hypervisor }}", when: not provision_skip_install | bool
+        - name: Provision | Find domain
+          command: /usr/bin/virsh dominfo
+            --domain {{ inventory_hostname }}
+          register: dominfo
+          changed_when: false
+          failed_when: false
+
+        - name: Provision | Destroy domain
+          command: /usr/bin/virsh destroy
+            --domain {{ inventory_hostname }}
+          when: dominfo.stdout is search("State:.*running")
+
+        - name: Provision | Undefine domain
+          command: /usr/bin/virsh undefine
+            --domain {{ inventory_hostname }}
+          when: dominfo.rc == 0
+
+        - name: Provision | Refresh pool
+          command: /usr/bin/virsh pool-refresh
+            --pool default
+          run_once: true
+          delegate_to: "{{ item }}"
+          connection: ssh
+          loop: "{{ ansible_play_batch | map('extract', hostvars, 'provision_hypervisor') | list | unique }}"
+
+        - name: Provision | Find overlay volume
+          command: /usr/bin/virsh vol-info
+            --vol {{ inventory_hostname }}.qcow2
+            --pool default
+          register: volinfo
+          changed_when: false
+          failed_when: false
+
+        - name: Provision | Delete overlay volume
+          command: /usr/bin/virsh vol-delete
+            --vol {{ inventory_hostname }}.qcow2
+            --pool default
+          when: volinfo.rc == 0
+
+        - name: Provision | Find base volume
+          command: /usr/bin/virsh vol-info
+            --vol {{ inventory_hostname }}-base-{{ provision_distro }}.qcow2
+            --pool default
+          register: volinfo
+          changed_when: false
+          failed_when: false
+
+        - name: Provision | Delete base volume
+          command: /usr/bin/virsh vol-delete
+            --vol {{ inventory_hostname }}-base-{{ provision_distro }}.qcow2
+            --pool default
+          when:
+            - volinfo.rc == 0
+            - provision_base | bool
+
+        - block: ## when: volinfo.rc != 0 or provision_base | bool
+            - name: Provision | Generate kickstart file
+              vars:
+                sshkey: "{{ lookup('file', '~/.ssh/id_rsa.pub') }}"
+                variant: "{{ provision_distro | regex_replace('RHEL-', '') | regex_replace('\\.[0-9]', '') }}"
+              template:
+                src: ks-{{ variant }}.j2
+                dest: /tmp/{{ inventory_hostname }}-ks.cfg
+
+            - name: Provision | Install domain
+              vars:
+                # Use first interface for installation. Prefer interfaces without gateway (internal).
+                interface: "{{ (provision_internal_interfaces + provision_external_interfaces) | first }}"
+                variant: "{{ provision_distro | regex_replace('-', '') | regex_replace('\\.[0-9]', '') | lower }}-unknown"
+              shell: sleep 1 &&
+                /usr/bin/virt-install
+                --name {{ inventory_hostname }}
+                --vcpus {{ provision_cpu }},placement=auto
+                --cpu host
+                --memory {{ provision_memory }}
+                --os-variant {{ variant }}
+                --disk path=./{{ inventory_hostname }}-base-{{ provision_distro }}.qcow2,format=qcow2,size={{ provision_disk }},bus=virtio,cache=writeback
+                {% for if in provision_interfaces %}
+                --network bridge={{ if.bridge }}
+                {% endfor %}
+                --graphics none
+                --location {{ provision_location }}
+                --initrd-inject /tmp/{{ inventory_hostname }}-ks.cfg
+                --extra-args "inst.ks=file:/{{ inventory_hostname }}-ks.cfg ip={{ interface.ip }}:::{{ interface.netmask }}:{{ inventory_hostname }}:{{ interface.device }}:none{% if interface.nameserver is defined %} nameserver={{ interface.nameserver }}{% endif %} console=ttyS0"
+                --noautoconsole
+              args:
+                chdir: /var/lib/libvirt/images
+              throttle: 1
+              notify: wait for install
+
+            - name: Provision | Cleanup kickstart file
+              file:
+                path: /tmp/{{ inventory_hostname }}-ks.cfg
+                state: absent
+
+          when: volinfo.rc != 0 or provision_base | bool
+
+      delegate_to: "{{ provision_hypervisor }}"
+      connection: ssh
+      when: not provision_skip_install | bool
+
+    - name: Wait for install
+      meta: flush_handlers
+      delegate_to: "{{ provision_hypervisor }}"
+      connection: ssh
+
+    - block: ## delegate_to: "{{ provision_hypervisor }}", when: not provision_skip_install | bool
+        - name: Provision | Undefine domain
+          command: /usr/bin/virsh undefine
+            --domain {{ inventory_hostname }}
+          when: volinfo.rc != 0 or provision_base | bool
+
+        - name: Provision | Create overlay volume
+          command: /usr/bin/qemu-img create
+            -f qcow2
+            -b ./{{ inventory_hostname }}-base-{{ provision_distro }}.qcow2
+            -F qcow2
+            ./{{ inventory_hostname }}.qcow2
+          args:
+            chdir: /var/lib/libvirt/images
+
+        - name: Provision | Define domain
+          vars:
+            variant: "{{ provision_distro | regex_replace('-', '') | regex_replace('\\.[0-9]', '') | lower }}-unknown"
+          command: /usr/bin/virt-install
+            --name {{ inventory_hostname }}
+            --vcpus {{ provision_cpu }},placement=auto
+            --cpu host
+            --memory {{ provision_memory }}
+            --os-variant {{ variant }}
+            --disk path=./{{ inventory_hostname }}.qcow2,format=qcow2,bus=virtio,cache=writeback
+            {% for if in provision_interfaces %}
+            --network bridge={{ if.bridge }}
+            {% endfor %}
+            --graphics none
+            --import
+            --noautoconsole
+          args:
+            chdir: /var/lib/libvirt/images
+          throttle: 1
+          notify: wait for boot
+
+      delegate_to: "{{ provision_hypervisor }}"
+      connection: ssh
+      when: not provision_skip_install | bool
+
+    - name: Wait for boot
+      meta: flush_handlers
+      delegate_to: "{{ provision_hypervisor }}"
+      connection: ssh
+
+    - name: Provision | Test login to new guest
+      wait_for_connection:
+        timeout: 300
+
+    - name: Provision | Group guests by their hypervisor
+      group_by:
+        key: hypervisor_{{ provision_hypervisor }}
+
+  handlers:
+    - name: wait for install
+      command: /usr/bin/virsh dominfo
+        --domain {{ inventory_hostname }}
+      register: dominfo
+      until: dominfo.stdout is search("State:.*shut off")
+      retries: 30
+      delay: 60
+      delegate_to: "{{ provision_hypervisor }}"
+      connection: ssh
+
+    - name: wait for boot
+      vars:
+        # Use first interface for Ansible communication. Prefer interfaces without gateway (internal).
+        interface: "{{ (provision_internal_interfaces + provision_external_interfaces) | first }}"
+      wait_for:
+        host: "{{ interface.ip }}"
+        port: 22
+        state: started
+        delay: 10
+        timeout: 120
+      delegate_to: "{{ provision_hypervisor }}"
+      connection: ssh
+
+- hosts: new_guests
+  gather_facts: true
+  gather_subset:
+    - "!all"
+    - virtual
+
+  tasks:
+    - name: Provision | Remove kickstart leftovers
+      file:
+        path: /root/{{ item }}
+        state: absent
+      loop:
+        - anaconda-ks.cfg
+        - original-ks.cfg
+        - ks-post.log

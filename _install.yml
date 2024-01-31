@@ -1,0 +1,42 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Check mandatory variables
+      assert:
+        that:
+          - "{{ ansible_env['GITHUB_USER'] is defined }}"
+          - "{{ ansible_env['GITHUB_TOKEN'] is defined }}"
+        msg: Please define the variables 'GITHUB_USER' and 'GITHUB_TOKEN'!
+
+    - name: Find latest release of acch/ansible-provision-virt
+      uri:
+        url: https://api.github.com/repos/acch/ansible-provision-virt/releases/latest
+        force_basic_auth: true
+        url_username: "{{ ansible_env['GITHUB_USER'] }}"
+        url_password: "{{ ansible_env['GITHUB_TOKEN'] }}"
+      register: latest_release
+
+    - name: Download acch/ansible-provision-virt {{ latest_release.json.tag_name }}
+      get_url:
+        url: "{{ latest_release.json.tarball_url }}"
+        dest: /tmp/provision.tar.gz
+        force_basic_auth: true
+        url_username: "{{ ansible_env['GITHUB_USER'] }}"
+        url_password: "{{ ansible_env['GITHUB_TOKEN'] }}"
+
+    - name: Prepare target directory for acch/ansible-provision-virt
+      file:
+        path: "{{ (playbook_dir, '/provision') | join }}"
+        state: directory
+        mode: "0775"
+
+    - name: Extract acch/ansible-provision-virt to target directory
+      unarchive:
+        src: /tmp/provision.tar.gz
+        dest: "{{ (playbook_dir, '/provision') | join }}"
+        extra_opts:
+          - --strip=1
+          - --no-anchored

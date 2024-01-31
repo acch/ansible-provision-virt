@@ -1,0 +1,10 @@
+---
+# https://ansible-lint.readthedocs.io/configuring/
+
+profile: production
+
+skip_list:
+  - fqcn[action-core]
+
+warn_list:
+  - yaml[line-length]

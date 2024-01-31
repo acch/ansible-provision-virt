@@ -1,0 +1,83 @@
+# Reference documentation:
+# https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/8/html-single/performing_an_advanced_rhel_installation/index#kickstart-commands-and-options-reference_installing-rhel-as-an-experienced-user
+
+#platform x86, AMD64, or Intel EM64T
+
+# Use text mode install
+text
+
+# Keyboard layouts
+keyboard de
+
+# System language
+lang en_US.UTF-8
+
+# System timezone
+timezone Europe/Berlin --utc --ntpservers={{ provision_ntpserver }}
+
+# System authorization information
+#auth --passalgo=sha512 --useshadow
+
+# Root password
+rootpw $1$qljFiU3E$jMOuKkcGXxCbL1rj89j29/ --iscrypted
+
+# Authorize SSH key for root user
+sshkey --username=root "{{ sshkey }}"
+
+# Network information
+{% for interface in provision_interfaces %}
+network --device={{ interface.device }} --bootproto=static --ip={{ interface.ip }} --netmask={{ interface.netmask }}{% if interface.gateway is defined %} --gateway={{ interface.gateway }}{% endif %}{% if interface.nameserver is defined %} --nameserver={{ interface.nameserver }}{% endif %}
+
+{% endfor %}
+
+# Use network installation
+url --url={{ provision_location }}
+
+# Configure YUM repositories
+repo --name={{ provision_distro }}-BaseOS --baseurl={{ provision_location }}/BaseOS --install --proxy=_none_
+repo --name={{ provision_distro }}-AppStream --baseurl={{ provision_location }}/AppStream --install --proxy=_none_
+
+# Firewall configuration
+firewall --disabled
+
+# SELinux configuration
+selinux --disabled
+
+# Do not configure the X Window System
+skipx
+
+# Clear the Master Boot Record
+zerombr
+
+# System bootloader configuration
+bootloader --location=mbr
+
+# Partition clearing information
+clearpart --all
+
+# Automatically create partitions
+autopart --type=plain
+
+# Power-off after installation
+poweroff
+
+%packages
+  @^minimal-environment
+  glibc-all-langpacks
+  {% for package in provision_packages %}
+  {{ package }}
+  {% endfor %}
+%end
+
+%post --log /root/ks-post.log
+  # Import Red Hat GPG key
+  rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release
+  {% if provision_hypervisor_ip is defined %}
+
+  # Add hypervisor IP lookup
+  echo "{{ provision_hypervisor_ip }}  hypervisor hypervisor.localdomain" >> /etc/hosts
+  {% endif %}
+%end
+
+%addon com_redhat_kdump --disable
+%end
