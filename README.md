@@ -24,7 +24,7 @@ Optimized for repeated instantiation of virtual machines: Performs Kickstart ins
 4.  Run the `_install.yml` playbook:
 
     ```sh
-    $ ansible-playbook _install.yml
+    $ ansible-playbook -i localhost, _install.yml
     ```
 
     This will download the latest release and extract it into a directory `provision/`. Running the `_install.yml` playbook again will update the directory to the latest release.
